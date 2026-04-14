@@ -1,23 +1,28 @@
-/* Get references to DOM elements */
-const categoryFilter = document.getElementById("categoryFilter");
+/* ============================================================
+   DOM REFERENCES
+   ============================================================ */
+const categoryPills    = document.getElementById("categoryPills");
+const productSearch    = document.getElementById("productSearch");
 const productsContainer = document.getElementById("productsContainer");
-const chatForm = document.getElementById("chatForm");
-const chatWindow = document.getElementById("chatWindow");
+const chatForm         = document.getElementById("chatForm");
+const chatWindow       = document.getElementById("chatWindow");
 const selectedProductsList = document.getElementById("selectedProductsList");
-const generateRoutineBtn = document.getElementById("generateRoutine");
-const clearSelectedBtn = document.getElementById("clearSelected");
-const userInput = document.getElementById("userInput");
-const sendBtn = document.getElementById("sendBtn");
+const generateRoutineBtn   = document.getElementById("generateRoutine");
+const clearSelectedBtn     = document.getElementById("clearSelected");
+const userInput        = document.getElementById("userInput");
+const sendBtn          = document.getElementById("sendBtn");
+const typingIndicator  = document.getElementById("typingIndicator");
+const copyRoutineBtn   = document.getElementById("copyRoutineBtn");
+const selectionCount   = document.getElementById("selectionCount");
+const skinTypePills    = document.getElementById("skinTypePills");
+const toastContainer   = document.getElementById("toastContainer");
 
-/* Show initial placeholder until user selects a category */
-productsContainer.innerHTML = `
-  <div class="placeholder-message">
-    Select a category to view products
-  </div>
-`;
-
-/* Added app state */
+/* ============================================================
+   APP STATE
+   ============================================================ */
 const STORAGE_KEY = "lorealSelectedProducts";
+
+/* Use the Cloudflare Worker URL from secrets.js, or fall back to default */
 const WORKER_URL =
   window.CLOUDFLARE_WORKER_URL ||
   window.WORKER_URL ||
@@ -27,20 +32,25 @@ const SYSTEM_PROMPT = `
 You are a L'Oréal Smart Routine & Product Advisor.
 
 Rules:
-- Stay focused only on beauty topics such as skincare, haircare, makeup, fragrance, grooming, and the user's selected routine.
-- When generating a routine, use ONLY the selected products provided.
-- Do not invent products that were not selected.
+- Stay focused only on beauty topics such as skincare, haircare, makeup, fragrance, and grooming.
+- When generating a routine, use ONLY the selected products provided. Do not invent products.
 - For follow-up questions, remember the earlier conversation and routine.
 - If the user asks something unrelated, briefly redirect them back to product or routine questions.
-- Keep answers clear, friendly, and organized.
+- Use clear formatting: use headers (##) for sections, bullet points (-) for steps, and bold (**) for product names.
+- Keep answers friendly, concise, and practical.
 `.trim();
 
 let allProducts = [];
 let selectedProductIds = new Set(loadSavedSelections());
 let conversationHistory = [];
 let routineGenerated = false;
+let lastRoutineText = "";     /* used by the Copy button */
+let currentCategory = null;  /* currently active category pill value */
+let selectedSkinType = null; /* user's selected skin type */
 
-/* Added helper for localStorage */
+/* ============================================================
+   LOCAL STORAGE HELPERS
+   ============================================================ */
 function loadSavedSelections() {
   try {
     const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
@@ -50,57 +60,161 @@ function loadSavedSelections() {
   }
 }
 
-/* Added helper for localStorage */
 function saveSelectedProducts() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify([...selectedProductIds]));
 }
 
-/* Added helper to safely show text */
-function escapeHtml(text) {
-  return text
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
+/* ============================================================
+   TOAST NOTIFICATIONS
+   ============================================================ */
+
+/* Show a short pop-up notification at the bottom of the screen */
+function showToast(message, type = "default") {
+  const toast = document.createElement("div");
+  toast.className = `toast ${type}`;
+  toast.textContent = message;
+  toastContainer.appendChild(toast);
+
+  /* Remove the element after the CSS animation finishes (2.8s total) */
+  setTimeout(() => toast.remove(), 2900);
 }
 
-/* Added helper to show chat messages */
+/* ============================================================
+   MARKDOWN RENDERER
+   Converts the AI response (which uses basic Markdown) into HTML
+   so bullet points, bold text, and headers display correctly.
+   ============================================================ */
+function renderMarkdown(text) {
+  /* Step 1: Escape HTML so raw tags are not injected */
+  let escaped = text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+
+  /* Step 2: Walk through each line and wrap it in the right element */
+  const lines = escaped.split("\n");
+  const output = [];
+  let inUl = false;
+  let inOl = false;
+
+  for (const line of lines) {
+    /* H2 heading: ## Heading */
+    if (/^## (.+)/.test(line)) {
+      closeList();
+      output.push(`<h3>${line.slice(3)}</h3>`);
+
+    /* H3 heading: ### Heading */
+    } else if (/^### (.+)/.test(line)) {
+      closeList();
+      output.push(`<h4>${line.slice(4)}</h4>`);
+
+    /* Unordered list: - Item */
+    } else if (/^- (.+)/.test(line)) {
+      if (inOl) { output.push("</ol>"); inOl = false; }
+      if (!inUl) { output.push("<ul>"); inUl = true; }
+      output.push(`<li>${line.slice(2)}</li>`);
+
+    /* Ordered list: 1. Item */
+    } else if (/^\d+\. (.+)/.test(line)) {
+      if (inUl) { output.push("</ul>"); inUl = false; }
+      if (!inOl) { output.push("<ol>"); inOl = true; }
+      output.push(`<li>${line.replace(/^\d+\. /, "")}</li>`);
+
+    /* Blank line — close any open list, add spacing */
+    } else if (line.trim() === "") {
+      closeList();
+      output.push(`<br>`);
+
+    /* Normal paragraph line */
+    } else {
+      closeList();
+      output.push(`<p>${line}</p>`);
+    }
+  }
+
+  /* Close any list that was still open */
+  closeList();
+
+  /* Helper defined here to access the outer arrays */
+  function closeList() {
+    if (inUl) { output.push("</ul>"); inUl = false; }
+    if (inOl) { output.push("</ol>"); inOl = false; }
+  }
+
+  /* Step 3: Apply inline formatting (bold, italic) */
+  return output
+    .join("\n")
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*([^*\n]+)\*/g, "<em>$1</em>");
+}
+
+/* ============================================================
+   CHAT HELPERS
+   ============================================================ */
+
+/* Add a chat bubble to the conversation window */
 function appendMessage(role, text) {
   const message = document.createElement("div");
   message.className = `chat-message ${role}`;
-  message.innerHTML = escapeHtml(text).replace(/\n/g, "<br>");
+
+  if (role === "assistant") {
+    /* Render markdown so AI responses look properly formatted */
+    message.innerHTML = renderMarkdown(text);
+  } else {
+    /* User messages: plain escaped text */
+    message.textContent = text;
+  }
+
   chatWindow.appendChild(message);
   chatWindow.scrollTop = chatWindow.scrollHeight;
 }
 
-/* Added helper to get the full selected product objects */
+/* Show the animated typing indicator while waiting for the AI */
+function showTyping() {
+  typingIndicator.style.display = "flex";
+  chatWindow.scrollTop = chatWindow.scrollHeight;
+}
+
+function hideTyping() {
+  typingIndicator.style.display = "none";
+}
+
+/* ============================================================
+   PRODUCT HELPERS
+   ============================================================ */
+
+/* Return full product objects for every selected id */
 function getSelectedProducts() {
   return allProducts.filter((product) => selectedProductIds.has(product.id));
 }
 
-/* Added helper to render selected products */
+/* Re-render the "Your Selection" chip list and update the count badge */
 function renderSelectedProducts() {
   const selectedProducts = getSelectedProducts();
+  const count = selectedProducts.length;
 
-  clearSelectedBtn.disabled = selectedProducts.length === 0;
+  /* Update count badge */
+  selectionCount.textContent = count;
+  selectionCount.style.background = count > 0 ? "#000" : "#ccc";
 
-  if (selectedProducts.length === 0) {
+  /* Enable/disable Clear All button */
+  clearSelectedBtn.disabled = count === 0;
+
+  if (count === 0) {
     selectedProductsList.innerHTML = `
-      <div class="placeholder-message selected-placeholder">
-        No products selected yet
-      </div>
+      <span class="selected-placeholder">No products selected yet</span>
     `;
     return;
   }
 
+  /* Build the chip list */
   selectedProductsList.innerHTML = selectedProducts
     .map(
       (product) => `
         <div class="selected-item">
-          <span>${product.brand} - ${product.name}</span>
-          <button class="remove-selected" data-id="${product.id}" type="button">
-            ×
+          <span>${escapeHtml(product.brand)} – ${escapeHtml(product.name)}</span>
+          <button class="remove-selected" data-id="${product.id}" type="button" title="Remove">
+            &times;
           </button>
         </div>
       `
@@ -108,7 +222,102 @@ function renderSelectedProducts() {
     .join("");
 }
 
-/* Added helper to read different Worker response formats */
+/* Escape HTML to prevent XSS when inserting text into the DOM */
+function escapeHtml(text) {
+  return String(text)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+/* ============================================================
+   DISPLAY PRODUCTS
+   Creates portrait product cards and inserts them into the grid
+   ============================================================ */
+function displayProducts(products) {
+  if (products.length === 0) {
+    productsContainer.innerHTML = `
+      <div class="empty-state">
+        <i class="fa-solid fa-magnifying-glass"></i>
+        <p>No products found</p>
+      </div>
+    `;
+    return;
+  }
+
+  productsContainer.innerHTML = products
+    .map((product) => {
+      const isSelected = selectedProductIds.has(product.id);
+
+      return `
+        <div class="product-card ${isSelected ? "selected" : ""}" data-id="${product.id}">
+          <div class="card-image">
+            <img src="${product.image}" alt="${escapeHtml(product.name)}" loading="lazy">
+          </div>
+          <div class="card-body">
+            <div class="card-brand">${escapeHtml(product.brand)}</div>
+            <h3 class="card-name">${escapeHtml(product.name)}</h3>
+            <details class="product-description">
+              <summary>Details</summary>
+              <p>${escapeHtml(product.description)}</p>
+            </details>
+            <div class="card-select-row">
+              <div class="card-select-icon">
+                ${isSelected ? '<i class="fa-solid fa-check"></i>' : ""}
+              </div>
+              ${isSelected ? "Selected" : "Add to Routine"}
+            </div>
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+}
+
+/* ============================================================
+   FILTERED VIEW HELPER
+   Applies both the active category and the search text
+   ============================================================ */
+function applyFilters() {
+  const query = productSearch.value.trim().toLowerCase();
+
+  /* If no category is selected and no search query, show the initial prompt */
+  if (currentCategory === null && !query) {
+    productsContainer.innerHTML = `
+      <div class="empty-state">
+        <i class="fa-solid fa-spa"></i>
+        <p>Select a category to browse products</p>
+      </div>
+    `;
+    return;
+  }
+
+  let filtered = allProducts;
+
+  /* Filter by category if one is selected */
+  if (currentCategory !== null && currentCategory !== "") {
+    filtered = filtered.filter((p) => p.category === currentCategory);
+  }
+
+  /* Further filter by search text */
+  if (query) {
+    filtered = filtered.filter(
+      (p) =>
+        p.name.toLowerCase().includes(query) ||
+        p.brand.toLowerCase().includes(query)
+    );
+  }
+
+  displayProducts(filtered);
+}
+
+/* ============================================================
+   CLOUDFLARE WORKER API CALL
+   ============================================================ */
+
+/* Parse the AI reply from whichever shape the Worker returns */
 function extractReply(data) {
   if (typeof data.reply === "string") return data.reply;
   if (typeof data.response === "string") return data.response;
@@ -125,113 +334,90 @@ function extractReply(data) {
       .trim();
   }
 
-  return "I received a response, but could not read it correctly.";
+  return "I received a response but could not read it. Please try again.";
 }
 
-/* Added helper to call your Cloudflare Worker */
 async function getAIResponse(messages) {
   const response = await fetch(WORKER_URL, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ messages })
   });
 
   if (!response.ok) {
-    throw new Error("Worker request failed");
+    throw new Error(`Worker returned ${response.status}`);
   }
 
   const data = await response.json();
   return extractReply(data);
 }
 
-/* Load product data from JSON file */
+/* ============================================================
+   LOAD PRODUCTS
+   ============================================================ */
 async function loadProducts() {
   const response = await fetch("products.json");
+  if (!response.ok) {
+    throw new Error(`Failed to load products (${response.status})`);
+  }
   const data = await response.json();
   return data.products;
 }
 
-/* Create HTML for displaying product cards */
-function displayProducts(products) {
-  if (products.length === 0) {
-    productsContainer.innerHTML = `
-      <div class="placeholder-message">
-        No products found in this category
-      </div>
-    `;
-    return;
-  }
+/* ============================================================
+   EVENT: Category pills
+   ============================================================ */
+categoryPills.addEventListener("click", (e) => {
+  const pill = e.target.closest(".pill");
+  if (!pill) return;
 
-  productsContainer.innerHTML = products
-    .map((product) => {
-      const isSelected = selectedProductIds.has(product.id);
+  /* Update active state */
+  categoryPills
+    .querySelectorAll(".pill")
+    .forEach((p) => p.classList.remove("active"));
+  pill.classList.add("active");
 
-      return `
-        <div class="product-card ${isSelected ? "selected" : ""}" data-id="${product.id}">
-          <div class="selected-badge">${isSelected ? "Selected" : "Select"}</div>
-          <img src="${product.image}" alt="${product.name}">
-          <div class="product-info">
-            <h3>${product.name}</h3>
-            <p>${product.brand}</p>
-            <details class="product-description">
-              <summary>View Description</summary>
-              <p>${product.description}</p>
-            </details>
-          </div>
-        </div>
-      `;
-    })
-    .join("");
-}
-
-/* Filter and display products when category changes */
-categoryFilter.addEventListener("change", async (e) => {
-  if (allProducts.length === 0) {
-    allProducts = await loadProducts();
-  }
-
-  const selectedCategory = e.target.value;
-
-  /* filter() creates a new array containing only products 
-     where the category matches what the user selected */
-  const filteredProducts = allProducts.filter(
-    (product) => product.category === selectedCategory
-  );
-
-  displayProducts(filteredProducts);
+  /* Store and apply the selected category */
+  currentCategory = pill.dataset.category;
+  applyFilters();
 });
 
-/* Added click handling so cards can be selected/unselected */
+/* ============================================================
+   EVENT: Live search
+   ============================================================ */
+productSearch.addEventListener("input", () => {
+  applyFilters();
+});
+
+/* ============================================================
+   EVENT: Select / deselect a product card
+   ============================================================ */
 productsContainer.addEventListener("click", (e) => {
-  if (e.target.closest("summary") || e.target.closest("details")) {
-    return;
-  }
+  /* Let clicks on the description toggle through without selecting */
+  if (e.target.closest("details") || e.target.closest("summary")) return;
 
   const card = e.target.closest(".product-card");
   if (!card) return;
 
   const productId = Number(card.dataset.id);
+  const product = allProducts.find((p) => p.id === productId);
 
   if (selectedProductIds.has(productId)) {
     selectedProductIds.delete(productId);
+    showToast(`Removed: ${product.name}`, "removed");
   } else {
     selectedProductIds.add(productId);
+    showToast(`Added: ${product.name}`, "added");
   }
 
   saveSelectedProducts();
   renderSelectedProducts();
-
-  if (categoryFilter.value) {
-    const filteredProducts = allProducts.filter(
-      (product) => product.category === categoryFilter.value
-    );
-    displayProducts(filteredProducts);
-  }
+  applyFilters(); /* re-render cards so the selection state updates */
 });
 
-/* Added remove button support in selected products list */
+/* ============================================================
+   EVENT: Remove a product from the selection panel
+   ============================================================ */
 selectedProductsList.addEventListener("click", (e) => {
   const removeButton = e.target.closest(".remove-selected");
   if (!removeButton) return;
@@ -240,58 +426,79 @@ selectedProductsList.addEventListener("click", (e) => {
   selectedProductIds.delete(productId);
   saveSelectedProducts();
   renderSelectedProducts();
-
-  if (categoryFilter.value) {
-    const filteredProducts = allProducts.filter(
-      (product) => product.category === categoryFilter.value
-    );
-    displayProducts(filteredProducts);
-  }
+  applyFilters();
 });
 
-/* Added clear all support */
+/* ============================================================
+   EVENT: Clear all selected products
+   ============================================================ */
 clearSelectedBtn.addEventListener("click", () => {
   selectedProductIds.clear();
   saveSelectedProducts();
   renderSelectedProducts();
-
-  if (categoryFilter.value) {
-    const filteredProducts = allProducts.filter(
-      (product) => product.category === categoryFilter.value
-    );
-    displayProducts(filteredProducts);
-  }
+  applyFilters();
+  showToast("Selection cleared", "removed");
 });
 
-/* Added routine generation button handler */
+/* ============================================================
+   EVENT: Skin type pills
+   ============================================================ */
+skinTypePills.addEventListener("click", (e) => {
+  const pill = e.target.closest(".skin-pill");
+  if (!pill) return;
+
+  /* Toggle: clicking the active type deselects it */
+  if (pill.classList.contains("active")) {
+    pill.classList.remove("active");
+    selectedSkinType = null;
+    return;
+  }
+
+  skinTypePills
+    .querySelectorAll(".skin-pill")
+    .forEach((p) => p.classList.remove("active"));
+  pill.classList.add("active");
+  selectedSkinType = pill.dataset.type;
+});
+
+/* ============================================================
+   EVENT: Generate Routine button
+   ============================================================ */
 generateRoutineBtn.addEventListener("click", async () => {
   const selectedProducts = getSelectedProducts();
 
   if (selectedProducts.length === 0) {
-    appendMessage("assistant", "Please select at least one product first.");
+    appendMessage("assistant", "Please select at least one product first, then I'll build your routine.");
+    chatWindow.scrollIntoView({ behavior: "smooth", block: "end" });
     return;
   }
 
   generateRoutineBtn.disabled = true;
   generateRoutineBtn.innerHTML = `
-    <i class="fa-solid fa-spinner fa-spin"></i> Generating...
+    <i class="fa-solid fa-spinner fa-spin"></i> Building your routine…
   `;
 
-  try {
-    appendMessage("assistant", "Building your personalized routine...");
+  /* Include skin type in the prompt if the user picked one */
+  const skinTypeNote = selectedSkinType
+    ? `\nThe user has **${selectedSkinType}** skin — tailor the advice accordingly.`
+    : "";
 
-    const prompt = `
-Create a personalized routine using ONLY these selected products:
+  const prompt = `
+Create a personalized beauty routine using ONLY these selected products:
 
 ${JSON.stringify(selectedProducts, null, 2)}
+${skinTypeNote}
 
 Requirements:
-- Organize the routine clearly
-- Explain how to use each selected product
-- Do not add products that were not selected
-- Keep the explanation friendly and practical
-    `.trim();
+- Organize by time of day (Morning / Evening) or by step, whichever fits best.
+- For each step, name the product and give a brief tip on how to use it.
+- Do not add or recommend products that are not in the list above.
+- Use clear formatting with ## section headers and - bullet points.
+  `.trim();
 
+  showTyping();
+
+  try {
     conversationHistory = [
       { role: "system", content: SYSTEM_PROMPT },
       { role: "user", content: prompt }
@@ -300,23 +507,54 @@ Requirements:
     const reply = await getAIResponse(conversationHistory);
     conversationHistory.push({ role: "assistant", content: reply });
     routineGenerated = true;
+    lastRoutineText = reply;
 
+    hideTyping();
     appendMessage("assistant", reply);
+
+    /* Show the Copy button now that a routine exists */
+    copyRoutineBtn.style.display = "flex";
+
+    chatWindow.scrollIntoView({ behavior: "smooth", block: "nearest" });
   } catch (error) {
+    hideTyping();
     appendMessage(
       "assistant",
-      "Sorry, I could not generate the routine right now. Check your Worker URL and API setup."
+      "Sorry, I couldn't generate the routine right now. Please check your Worker URL and API setup."
     );
     console.error(error);
   } finally {
     generateRoutineBtn.disabled = false;
     generateRoutineBtn.innerHTML = `
-      <i class="fa-solid fa-wand-magic-sparkles"></i> Generate Routine
+      <i class="fa-solid fa-wand-magic-sparkles"></i> Generate My Routine
     `;
   }
 });
 
-/* Chat form submission handler - placeholder for OpenAI integration */
+/* ============================================================
+   EVENT: Copy routine to clipboard
+   ============================================================ */
+copyRoutineBtn.addEventListener("click", async () => {
+  if (!lastRoutineText) return;
+
+  try {
+    await navigator.clipboard.writeText(lastRoutineText);
+    copyRoutineBtn.classList.add("copied");
+    copyRoutineBtn.innerHTML = `<i class="fa-solid fa-check"></i> Copied!`;
+    showToast("Routine copied to clipboard", "success");
+
+    setTimeout(() => {
+      copyRoutineBtn.classList.remove("copied");
+      copyRoutineBtn.innerHTML = `<i class="fa-regular fa-copy"></i> Copy`;
+    }, 2500);
+  } catch (error) {
+    showToast("Could not copy — please copy manually", "error");
+  }
+});
+
+/* ============================================================
+   EVENT: Chat form — follow-up questions
+   ============================================================ */
 chatForm.addEventListener("submit", async (e) => {
   e.preventDefault();
 
@@ -329,37 +567,56 @@ chatForm.addEventListener("submit", async (e) => {
   if (!routineGenerated) {
     appendMessage(
       "assistant",
-      "Generate a routine first, then ask follow-up questions about it."
+      "Please generate a routine first using the button above, then ask me follow-up questions about it!"
     );
     return;
   }
 
   sendBtn.disabled = true;
+  showTyping();
 
   try {
     conversationHistory.push({ role: "user", content: question });
     const reply = await getAIResponse(conversationHistory);
     conversationHistory.push({ role: "assistant", content: reply });
+    hideTyping();
     appendMessage("assistant", reply);
   } catch (error) {
-    appendMessage(
-      "assistant",
-      "Sorry, I could not answer that right now. Please try again."
-    );
+    hideTyping();
+    appendMessage("assistant", "Sorry, I couldn't answer that right now. Please try again.");
     console.error(error);
   } finally {
     sendBtn.disabled = false;
   }
 });
 
-/* Added initial load so saved products appear after refresh */
+/* ============================================================
+   INIT — runs once when the page loads
+   ============================================================ */
 async function init() {
-  allProducts = await loadProducts();
-  renderSelectedProducts();
-  appendMessage(
-    "assistant",
-    "Hi! Select products, generate a routine, and then ask follow-up questions."
-  );
+  try {
+    /* Load all products and restore saved selections */
+    allProducts = await loadProducts();
+    renderSelectedProducts();
+
+    /* Greet the user */
+    appendMessage(
+      "assistant",
+      "Hi! Browse the catalog, select the products you own or want to try, then hit **Generate My Routine** — I'll build a personalized routine just for you. You can also ask me follow-up questions after."
+    );
+  } catch (error) {
+    console.error("Failed to initialize app:", error);
+    productsContainer.innerHTML = `
+      <div class="empty-state">
+        <i class="fa-solid fa-triangle-exclamation"></i>
+        <p>Could not load products. Please refresh the page.</p>
+      </div>
+    `;
+    appendMessage(
+      "assistant",
+      "Sorry, I couldn't load the product catalog. Please refresh the page and try again."
+    );
+  }
 }
 
 init();
